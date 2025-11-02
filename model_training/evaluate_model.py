@@ -69,7 +69,10 @@ model = GRUDecoder(
 )
 
 # load model weights
-checkpoint = torch.load(os.path.join(model_path, 'checkpoint/best_checkpoint'), weights_only=False)
+if torch.device(device).type == 'cuda':
+    checkpoint = os.path.join(model_path, 'checkpoint/best_checkpoint', weights_only=False)
+else:
+    checkpoint = torch.load(os.path.join(model_path, 'checkpoint/best_checkpoint'), weights_only=False, map_location=torch.device('cpu'))
 # rename keys to not start with "module." (happens if model was saved with DataParallel)
 for key in list(checkpoint['model_state_dict'].keys()):
     checkpoint['model_state_dict'][key.replace("module.", "")] = checkpoint['model_state_dict'].pop(key)
