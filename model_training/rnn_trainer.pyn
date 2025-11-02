@@ -1,0 +1,85 @@
+# %% [markdown]
+# Brain-to-Text Training Percent Script (.pyn)
+# 
+# Run cells top-to-bottom. Configure GRU or RNNT and train interactively.
+
+# %%
+# Environment and imports
+import sys, os, pathlib
+from datetime import datetime
+
+# Ensure local imports resolve
+FILE_DIR = pathlib.Path(__file__).resolve().parent
+os.chdir(FILE_DIR)
+if str(FILE_DIR) not in sys.path:
+    sys.path.insert(0, str(FILE_DIR))
+
+import torch
+import numpy as np
+from omegaconf import OmegaConf
+
+from rnn_trainer import BrainToTextDecoder_Trainer
+
+print(f"Torch: {torch.__version__}")
+print(f"CUDA available: {torch.cuda.is_available()}")
+
+# %%
+# Load and customize args
+args_path = FILE_DIR / 'rnn_args.yaml'
+args = OmegaConf.load(str(args_path))
+
+# Choose model type: 'GRU' (default) or 'RNNT'
+# Set to RNNT to use the RNNT path we wired up
+args['model_type'] = args.get('model_type', 'GRU')  # options: 'GRU' or 'RNNT'
+
+# Output/checkpoint dirs (timestamped)
+run_tag = datetime.now().strftime('%Y%m%d_%H%M%S')
+base_output = FILE_DIR / 'outputs' / run_tag
+base_ckpt = FILE_DIR / 'checkpoints' / run_tag
+args['output_dir'] = str(base_output)
+args['checkpoint_dir'] = str(base_ckpt)
+
+# Common training toggles
+args['mode'] = 'train'
+args['save_best_checkpoint'] = True
+args['save_final_model'] = True
+args['save_val_metrics'] = True
+
+# AMP toggle
+args['use_amp'] = args.get('use_amp', True)
+
+print('Model type:', args.get('model_type', 'GRU'))
+print('Output dir:', args['output_dir'])
+print('Checkpoint dir:', args['checkpoint_dir'])
+
+# %%
+# Initialize trainer
+trainer = BrainToTextDecoder_Trainer(args)
+trainer.logger.info('Trainer initialized from .pyn script.')
+
+# %%
+# (Optional) Quick sanity check: run 1 val step without training
+_ = trainer.validation(loader = trainer.val_loader, return_logits = False, return_data = False)
+print('Ran a validation pass successfully.')
+
+# %%
+# Train
+train_stats = trainer.train()
+print('Best avg val PER:', trainer.best_val_PER)
+print('Checkpoints saved to:', args['checkpoint_dir'])
+
+# %%
+# Inspect saved artifacts
+import json
+
+val_metrics_pkl = os.path.join(args['checkpoint_dir'], 'val_metrics.pkl')
+args_yaml = os.path.join(args['checkpoint_dir'], 'args.yaml')
+
+print('Args YAML exists:', os.path.exists(args_yaml))
+print('Val metrics pickle exists:', os.path.exists(val_metrics_pkl))
+
+# List all checkpoints in dir
+for root, _, files in os.walk(args['checkpoint_dir']):
+    for f in files:
+        if 'checkpoint' in f:
+            print('Found checkpoint:', f)

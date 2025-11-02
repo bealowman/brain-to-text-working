@@ -8,6 +8,15 @@ endif(CCACHE_FOUND)
 
 project(wenet VERSION 0.1)
 
+# Ensure modern C++ and PIC for all the static libs you build
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+# Make sure CMake knows which Python to target so pybind11 uses the correct suffix (cpython-39, etc.)
+find_package(Python3 COMPONENTS Interpreter Development.Module REQUIRED)
+
+
 add_definitions(-D_GLIBCXX_USE_CXX11_ABI=0)
 
 option(GRPC "whether to build gRPC" OFF)

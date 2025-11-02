@@ -13,7 +13,7 @@ import json
 import pickle
 
 from dataset import BrainToTextDataset, train_test_split_indicies
-from data_augmentations import gauss_smooth
+from data_augmentations import gauss_smooth, random_mask
 
 import torchaudio.functional as F # for edit distance
 from omegaconf import OmegaConf
@@ -22,7 +22,7 @@ torch.set_float32_matmul_precision('high') # makes float32 matmuls faster on som
 torch.backends.cudnn.deterministic = True # makes training more reproducible
 torch._dynamo.config.cache_size_limit = 64
 
-from rnn_model import GRUDecoder
+from rnn_model import GRUDecoder, RNNT
 
 class BrainToTextDecoder_Trainer:
     """
@@ -117,21 +117,37 @@ class BrainToTextDecoder_Trainer:
             torch.manual_seed(self.args['seed'])
 
         # Initialize the model 
-        self.model = GRUDecoder(
-            neural_dim = self.args['model']['n_input_features'],
-            n_units = self.args['model']['n_units'],
-            n_days = len(self.args['dataset']['sessions']),
-            n_classes  = self.args['dataset']['n_classes'],
-            rnn_dropout = self.args['model']['rnn_dropout'], 
-            input_dropout = self.args['model']['input_network']['input_layer_dropout'], 
-            n_layers = self.args['model']['n_layers'],
-            patch_size = self.args['model']['patch_size'],
-            patch_stride = self.args['model']['patch_stride'],
-        )
+        if 'model_type' in self.args and self.args['model_type'] == "RNNT":
+            self.model = RNNT(
+                input_dim = self.args['model']['n_input_features'],
+                enc_dim = self.args['model']['n_units'],
+                pred_dim = self.args['model']['n_units'],
+                joint_dim = self.args['model']['n_units'],
+                num_classes = self.args['dataset']['n_classes'],
+                n_days = len(self.args['dataset']['sessions']),
+                input_dropout = self.args['model']['input_network']['input_layer_dropout'],
+                patch_size = self.args['model']['patch_size'],
+                patch_stride = self.args['model']['patch_stride'],
+            )
+        else:
+            self.model = GRUDecoder(
+                neural_dim = self.args['model']['n_input_features'],
+                n_units = self.args['model']['n_units'],
+                n_days = len(self.args['dataset']['sessions']),
+                n_classes  = self.args['dataset']['n_classes'],
+                rnn_dropout = self.args['model']['rnn_dropout'], 
+                input_dropout = self.args['model']['input_network']['input_layer_dropout'], 
+                n_layers = self.args['model']['n_layers'],
+                patch_size = self.args['model']['patch_size'],
+                patch_stride = self.args['model']['patch_stride'],
+            )
 
         # Call torch.compile to speed up training
         self.logger.info("Using torch.compile")
-        self.model = torch.compile(self.model)
+        try:
+            self.model = torch.compile(self.model)
+        except Exception as e:
+            self.logger.warning(f"torch.compile failed: {e}. Continuing without compilation.")
 
         self.logger.info(f"Initialized RNN decoding model")
 
@@ -479,6 +495,11 @@ class BrainToTextDecoder_Trainer:
                 smooth_kernel_std = self.transform_args['smooth_kernel_std'],
                 smooth_kernel_size= self.transform_args['smooth_kernel_size'],
                 )
+        if self.transform_args['mask_data']:
+            features = random_mask(
+                inputs = features,
+                max_mask_width = self.transform_args['max_mask_width'],
+                )
             
         
         return features, n_time_steps
@@ -531,16 +552,37 @@ class BrainToTextDecoder_Trainer:
 
                 adjusted_lens = ((n_time_steps - self.args['model']['patch_size']) / self.args['model']['patch_stride'] + 1).to(torch.int32)
 
-                # Get phoneme predictions 
-                logits = self.model(features, day_indicies)
+                # Get phoneme predictions / compute loss
+                if 'model_type' in self.args and self.args['model_type'] == "RNNT":
+                    # Build predictor inputs with SOS = blank (0)
+                    B = labels.shape[0]
+                    sos = torch.zeros((B, 1), dtype=torch.long, device=self.device)
+                    targets_with_sos = torch.cat([sos, labels], dim=1)  # [B, U+1]
 
-                # Calculate CTC Loss
-                loss = self.ctc_loss(
-                    log_probs = torch.permute(logits.log_softmax(2), [1, 0, 2]),
-                    targets = labels,
-                    input_lengths = adjusted_lens,
-                    target_lengths = phone_seq_lens
+                    # Compute RNNT logits [B, T', U+1, C]
+                    logits = self.model(features, day_indicies, targets_with_sos)
+
+                    # Encoder lengths after optional patching
+                    enc_lens = ((n_time_steps - self.args['model']['patch_size']) / self.args['model']['patch_stride'] + 1).to(torch.int32) if self.args['model']['patch_size'] > 0 else n_time_steps.to(torch.int32)
+
+                    # RNNT Loss (blank id = 0)
+                    loss = F.rnnt_loss(
+                        logits = logits,
+                        targets = labels,
+                        input_lengths = enc_lens,
+                        target_lengths = phone_seq_lens,
+                        blank = 0,
+                        reduction = 'mean'
                     )
+                else:
+                    logits = self.model(features, day_indicies)
+                    # Calculate CTC Loss
+                    loss = self.ctc_loss(
+                        log_probs = torch.permute(logits.log_softmax(2), [1, 0, 2]),
+                        targets = labels,
+                        input_lengths = adjusted_lens,
+                        target_lengths = phone_seq_lens
+                        )
                     
                 loss = torch.mean(loss) # take mean loss over batches
             
@@ -706,34 +748,60 @@ class BrainToTextDecoder_Trainer:
 
                     adjusted_lens = ((n_time_steps - self.args['model']['patch_size']) / self.args['model']['patch_stride'] + 1).to(torch.int32)
 
-                    logits = self.model(features, day_indicies)
-    
-                    loss = self.ctc_loss(
-                        torch.permute(logits.log_softmax(2), [1, 0, 2]),
-                        labels,
-                        adjusted_lens,
-                        phone_seq_lens,
-                    )
-                    loss = torch.mean(loss)
+                    if 'model_type' in self.args and self.args['model_type'] == "RNNT":
+                        # RNNT path
+                        B = labels.shape[0]
+                        sos = torch.zeros((B, 1), dtype=torch.long, device=self.device)
+                        targets_with_sos = torch.cat([sos, labels], dim=1)
+
+                        logits = self.model(features, day_indicies, targets_with_sos)
+
+                        enc_lens = ((n_time_steps - self.args['model']['patch_size']) / self.args['model']['patch_stride'] + 1).to(torch.int32) if self.args['model']['patch_size'] > 0 else n_time_steps.to(torch.int32)
+
+                        loss = F.rnnt_loss(
+                            logits = logits,
+                            targets = labels,
+                            input_lengths = enc_lens,
+                            target_lengths = phone_seq_lens,
+                            blank = 0,
+                            reduction = 'mean'
+                        )
+                    else:
+                        logits = self.model(features, day_indicies)
+                        loss = self.ctc_loss(
+                            torch.permute(logits.log_softmax(2), [1, 0, 2]),
+                            labels,
+                            adjusted_lens,
+                            phone_seq_lens,
+                        )
+                        loss = torch.mean(loss)
 
                 metrics['losses'].append(loss.cpu().detach().numpy())
 
                 # Calculate PER per day and also avg over entire validation set
                 batch_edit_distance = 0 
                 decoded_seqs = []
-                for iterIdx in range(logits.shape[0]):
-                    decoded_seq = torch.argmax(logits[iterIdx, 0 : adjusted_lens[iterIdx], :].clone().detach(),dim=-1)
-                    decoded_seq = torch.unique_consecutive(decoded_seq, dim=-1)
-                    decoded_seq = decoded_seq.cpu().detach().numpy()
-                    decoded_seq = np.array([i for i in decoded_seq if i != 0])
-
-                    trueSeq = np.array(
-                        labels[iterIdx][0 : phone_seq_lens[iterIdx]].cpu().detach()
-                    )
-            
-                    batch_edit_distance += F.edit_distance(decoded_seq, trueSeq)
-
-                    decoded_seqs.append(decoded_seq)
+                if 'model_type' in self.args and self.args['model_type'] == "RNNT":
+                    # RNNT greedy decoding per sample
+                    preds = self.model.greedy_decode(features, day_indicies, blank_id = 0)
+                    for iterIdx in range(len(preds)):
+                        decoded_seq = np.array(preds[iterIdx], dtype=np.int64)
+                        trueSeq = np.array(
+                            labels[iterIdx][0 : phone_seq_lens[iterIdx]].cpu().detach()
+                        )
+                        batch_edit_distance += F.edit_distance(decoded_seq, trueSeq)
+                        decoded_seqs.append(decoded_seq)
+                else:
+                    for iterIdx in range(logits.shape[0]):
+                        decoded_seq = torch.argmax(logits[iterIdx, 0 : adjusted_lens[iterIdx], :].clone().detach(),dim=-1)
+                        decoded_seq = torch.unique_consecutive(decoded_seq, dim=-1)
+                        decoded_seq = decoded_seq.cpu().detach().numpy()
+                        decoded_seq = np.array([i for i in decoded_seq if i != 0])
+                        trueSeq = np.array(
+                            labels[iterIdx][0 : phone_seq_lens[iterIdx]].cpu().detach()
+                        )
+                        batch_edit_distance += F.edit_distance(decoded_seq, trueSeq)
+                        decoded_seqs.append(decoded_seq)
 
             day = batch['day_indicies'][0].item()
                 

@@ -61,8 +61,19 @@ pip install \
     bitsandbytes==0.41.1
 
 # cd to the language model directory and install the language model
+# cd to the language model directory and build the Python extension properly
 cd language_model/runtime/server/x86
-python setup.py install
+
+# Make sure pybind11 CMake config is discoverable
+python -m pip install -U pip setuptools wheel "pybind11[global]" scikit-build-core
+
+# Clean any old builds
+rm -rf build dist *.egg-info
+
+# Use PEP 517-compliant build (this drives your setup.py’s CMake logic)
+export CMAKE_ARGS="${CMAKE_ARGS:-} -DPython3_EXECUTABLE=$(python -c 'import sys; print(sys.executable)') -DCMAKE_POLICY_VERSION_MINIMUM=3.5"
+
+python -m pip install -v .
 
 # cd back to the root directory
 cd ../../../..
