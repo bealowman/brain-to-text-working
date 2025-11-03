@@ -129,6 +129,8 @@ pbar.close()
 
 
 # convert logits to phoneme sequences and print them out
+aggregate_edit_distance = 0
+total_num_phonemes = 0
 for session, data in test_data.items():
     data['pred_seq'] = []
     for trial in range(len(data['logits'])):
@@ -146,16 +148,23 @@ for session, data in test_data.items():
         # print out the predicted sequences
         block_num = data['block_num'][trial]
         trial_num = data['trial_num'][trial]
+        true_seq = data['seq_class_ids'][trial][0:data['seq_len'][trial]]
+        true_seq = [LOGIT_TO_PHONEME[p] for p in true_seq]
         print(f'Session: {session}, Block: {block_num}, Trial: {trial_num}')
         if eval_type == 'val':
             sentence_label = data['sentence_label'][trial]
-            true_seq = data['seq_class_ids'][trial][0:data['seq_len'][trial]]
-            true_seq = [LOGIT_TO_PHONEME[p] for p in true_seq]
 
             print(f'Sentence label:      {sentence_label}')
             print(f'True sequence:       {" ".join(true_seq)}')
+            print(f'Word edit distance:  {editdistance.eval(true_seq, pred_seq)}')
+        total_num_phonemes += len(true_seq)
+        aggregate_edit_distance += editdistance.eval(true_seq, pred_seq)
         print(f'Predicted Sequence:  {" ".join(pred_seq)}')
         print()
+
+print(f'Total number of phonemes: {total_num_phonemes}')
+print(f'Aggregate edit distance: {aggregate_edit_distance}')
+print(f'Aggregate PER: {100 * aggregate_edit_distance / total_num_phonemes:.2f}%')
 
 
 # language model inference via redis

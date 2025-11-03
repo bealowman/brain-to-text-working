@@ -80,7 +80,7 @@ dataset:
   must_include_days: null # specific days to include in the dataset
   test_percentage: 0.1 # percentage of data to use for testing
   feature_subset: null # specific features to include in the dataset
-
+  use_diphones: false # whether to use dipones for the dataset
   dataset_dir: ../data/hdf5_data_final # directory containing the dataset
   bad_trials_dict: null # dictionary of bad trials to exclude from the dataset
   sessions: # list of sessions to include in the dataset

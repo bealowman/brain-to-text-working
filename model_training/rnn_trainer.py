@@ -18,6 +18,8 @@ from data_augmentations import gauss_smooth, random_mask
 import torchaudio.functional as F # for edit distance
 from omegaconf import OmegaConf
 
+from evaluate_model_helpers import LOGIT_TO_DIPHONE, LOGIT_TO_PHONEME
+
 torch.set_float32_matmul_precision('high') # makes float32 matmuls faster on some GPUs
 torch.backends.cudnn.deterministic = True # makes training more reproducible
 torch._dynamo.config.cache_size_limit = 64
@@ -449,6 +451,24 @@ class BrainToTextDecoder_Trainer:
         
         return attention_mask_float
 
+    def phoneme_to_diphone(self, labels, phone_seq_lens):
+        diphone_labels = []
+        diphone_seq_lens = []
+        for label, seq_len in zip(labels, phone_seq_lens):
+            diphone_label = []
+            for i in range(seq_len - 1):
+                phone_a = label[i].item()
+                phone_b = label[i+1].item()
+                diphone = (LOGIT_TO_PHONEME[phone_a], LOGIT_TO_PHONEME[phone_b])
+                diphone_idx = LOGIT_TO_DIPHONE.index(diphone)
+                diphone_label.append(diphone_idx)
+            diphone_seq_lens.append(torch.tensor(len(diphone_label)))
+            if len(diphone_label) < label.numel():
+                pad = torch.zeros(label.numel() - len(diphone_label), dtype=int)
+                diphone_label = torch.cat((torch.tensor(diphone_label), pad))
+            diphone_labels.append(diphone_label)
+        return torch.stack(diphone_labels), torch.stack(diphone_seq_lens)
+
     def transform_data(self, features, n_time_steps, mode = 'train'):
         '''
         Apply various augmentations and smoothing to data
@@ -542,6 +562,8 @@ class BrainToTextDecoder_Trainer:
             labels = batch['seq_class_ids'].to(self.device)
             n_time_steps = batch['n_time_steps'].to(self.device)
             phone_seq_lens = batch['phone_seq_lens'].to(self.device)
+            if self.args['use_diphones']:
+                labels, phone_seq_lens = self.phoneme_to_diphone(labels, phone_seq_lens)
             day_indicies = batch['day_indicies'].to(self.device)
 
             # Use autocast for efficiency
@@ -732,6 +754,8 @@ class BrainToTextDecoder_Trainer:
             labels = batch['seq_class_ids'].to(self.device)
             n_time_steps = batch['n_time_steps'].to(self.device)
             phone_seq_lens = batch['phone_seq_lens'].to(self.device)
+            if self.args['use_diphones']:
+                labels, phone_seq_lens = self.phoneme_to_diphone(labels, phone_seq_lens)
             day_indicies = batch['day_indicies'].to(self.device)
 
             # Determine if we should perform validation on this batch

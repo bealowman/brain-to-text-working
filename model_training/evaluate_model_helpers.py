@@ -19,6 +19,8 @@ LOGIT_TO_PHONEME = [
     ' | ',
 ]
 
+LOGIT_TO_DIPHONE = [(a, b) for a in LOGIT_TO_PHONEME for b in LOGIT_TO_PHONEME]
+
 def _extract_transcription(input):
     endIdx = np.argwhere(input == 0)[0, 0]
     trans = ''
