@@ -14,6 +14,8 @@ model:
     input_trainable: true # whether the input layer is trainable
     input_layer_dropout: 0.2 # dropout rate for the input layer
 
+model_type: 'GRU'
+
 gpu_number: '1' # GPU number to use for training, formatted as a string (e.g., '0', '1', etc.)
 mode: train
 use_amp: true # whether to use automatic mixed precision (AMP) for training
@@ -68,6 +70,8 @@ dataset:
     smooth_kernel_size: 100 # size of the smoothing kernel applied to the data
     smooth_data: true # whether to smooth the data
     smooth_kernel_std: 2 # standard deviation of the smoothing kernel applied to the data
+    mask_data:
+      max_mask_width: 40  # maximum width of temporal mask to apply (0 to disable, typical values: 20-40)
 
   neural_dim: 512 # dimensionality of the neural data
   batch_size: 64 # batch size for training

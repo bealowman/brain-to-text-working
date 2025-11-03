@@ -64,13 +64,13 @@ def frequency_mask(inputs, max_freq_mask_width = 15, max_time_mask_width = 40):
     max_freq_mask_width = min(max_freq_mask_width, num_freq_bins)
     freq_mask_width = torch.randint(0, max_freq_mask_width + 1, (1,)).item()
     freq_mask_start = torch.randint(0, num_freq_bins - max_freq_mask_width + 1, (1,)).item()
-    masked_inputs = masked_inputs[:, :, freq_mask_start:freq_mask_width] = 0
+    masked_inputs[:, :, freq_mask_start:freq_mask_start+freq_mask_width] = 0
 
     # time mask
     num_time_bins = inputs.shape[1]
     max_time_mask_width = min(max_time_mask_width, inputs.shape[1])
     time_mask_width = torch.randint(0, max_time_mask_width + 1, (1,)).item()
     time_mask_start = torch.randint(0, num_time_bins - max_time_mask_width + 1, (1,)).item()
-    masked_inputs = masked_inputs[:, time_mask_start:time_mask_width, :] = 0
+    masked_inputs[:, time_mask_start:time_mask_start+time_mask_width, :] = 0
 
     return masked_inputs

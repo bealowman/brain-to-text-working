@@ -1,0 +1,8 @@
+README.md
+setup.py
+nejm_b2txt_utils/__init__.py
+nejm_b2txt_utils/general_utils.py
+nejm_b2txt_utils.egg-info/PKG-INFO
+nejm_b2txt_utils.egg-info/SOURCES.txt
+nejm_b2txt_utils.egg-info/dependency_links.txt
+nejm_b2txt_utils.egg-info/top_level.txt

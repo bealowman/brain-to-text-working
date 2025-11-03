@@ -486,6 +486,13 @@ class BrainToTextDecoder_Trainer:
                 features = features[:, cut:, :]
                 n_time_steps = n_time_steps - cut
 
+            # apply temporal masking (training only)
+            if self.transform_args.get('mask_data', {}).get('max_mask_width', 0) > 0:
+                features = random_mask(
+                    inputs = features,
+                    max_mask_width = self.transform_args['mask_data']['max_mask_width'],
+                    )
+
         # Apply Gaussian smoothing to data 
         # This is done in both training and validation
         if self.transform_args['smooth_data']:
@@ -494,11 +501,6 @@ class BrainToTextDecoder_Trainer:
                 device = self.device,
                 smooth_kernel_std = self.transform_args['smooth_kernel_std'],
                 smooth_kernel_size= self.transform_args['smooth_kernel_size'],
-                )
-        if self.transform_args['mask_data']:
-            features = random_mask(
-                inputs = features,
-                max_mask_width = self.transform_args['max_mask_width'],
                 )
             
         
