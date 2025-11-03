@@ -10,3 +10,16 @@ __pycache__/
 .venv/
 venv/
 *.log
+
+# model checkpoints
+*.pt
+*.pth
+*.ckpt
+*.h5
+*.onnx
+
+# training outputs
+model_training/trained_models/
+checkpoints/
+logs/
+runs/
