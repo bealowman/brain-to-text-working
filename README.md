@@ -105,4 +105,37 @@ Our Kaldi-based ngram implementation requires a different version of torch than 
 ./setup_lm.sh
 ```
 
-Verify it worked by activating the conda environment with the command `conda activate b2txt25_lm`.
+Verify it worked by activating the conda environment with the command `conda activate 
+b2txt25_lm`.
+
+
+
+# Setup without the setup_lm script
+
+```bash
+conda env remove -n b2txt25_lm #if you already had the environment due to broken setup_lm.sh
+```
+
+```bash
+conda create -n b2txt25_lm
+```
+
+```bash
+pip install -U pip setuptools wheel "pybind11[global]" scikit-build-core
+```
+
+```bash
+cd language_model/runtime/server/x86
+```
+
+```bash
+rm -rf build dist *.egg-info
+```
+
+```bash
+export CMAKE_ARGS="-DPython3_EXECUTABLE=$(python -c 'import sys; print(sys.executable)')-DCMAKE_POLICY_VERSION_MINIMUM=3.5"
+```
+
+```bash
+python -m pip install -v .
+```
