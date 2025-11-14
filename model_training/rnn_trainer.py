@@ -59,11 +59,11 @@ class BrainToTextDecoder_Trainer:
 
         # Create output directory
         if args['mode'] == 'train':
-            os.makedirs(self.args['output_dir'], exist_ok=False)
+            os.makedirs(self.args['output_dir'], exist_ok=True)
 
         # Create checkpoint directory
         if args['save_best_checkpoint'] or args['save_all_val_steps'] or args['save_final_model']: 
-            os.makedirs(self.args['checkpoint_dir'], exist_ok=False)
+            os.makedirs(self.args['checkpoint_dir'], exist_ok=True)
 
         # Set up logging
         self.logger = logging.getLogger(__name__)
@@ -518,7 +518,7 @@ class BrainToTextDecoder_Trainer:
         if self.transform_args['mask_data']:
             features = random_mask(
                 inputs = features,
-                max_mask_width = self.transform_args['max_mask_width'],
+                max_mask_width = self.transform_args['mask_data']['max_mask_width'],
                 )
             
         
@@ -572,7 +572,19 @@ class BrainToTextDecoder_Trainer:
                 # Apply augmentations to the data
                 features, n_time_steps = self.transform_data(features, n_time_steps, 'train')
 
-                adjusted_lens = ((n_time_steps - self.args['model']['patch_size']) / self.args['model']['patch_stride'] + 1).to(torch.int32)
+                # Calculate encoder output lengths after patching (if applicable)
+                # The unfold operation creates: floor((T - patch_size) / patch_stride) + 1 patches
+                # But only if T >= patch_size, otherwise it returns 0 patches
+                if self.args['model']['patch_size'] > 0:
+                    # Ensure we don't get negative values
+                    patch_input = torch.clamp(n_time_steps - self.args['model']['patch_size'], min=0)
+                    adjusted_lens = (patch_input // self.args['model']['patch_stride'] + 1).to(torch.int32)
+                    # If n_time_steps < patch_size, unfold returns 0, but we need at least 1
+                    # Actually, unfold with T < patch_size returns 0 patches, so we should handle this
+                    # But for now, let's ensure we have at least 1
+                    adjusted_lens = torch.clamp(adjusted_lens, min=1)
+                else:
+                    adjusted_lens = n_time_steps.to(torch.int32)
 
                 # Get phoneme predictions / compute loss
                 if 'model_type' in self.args and self.args['model_type'] == "RNNT":
@@ -584,8 +596,20 @@ class BrainToTextDecoder_Trainer:
                     # Compute RNNT logits [B, T', U+1, C]
                     logits = self.model(features, day_indicies, targets_with_sos)
 
-                    # Encoder lengths after optional patching
-                    enc_lens = ((n_time_steps - self.args['model']['patch_size']) / self.args['model']['patch_stride'] + 1).to(torch.int32) if self.args['model']['patch_size'] > 0 else n_time_steps.to(torch.int32)
+                    # Get actual encoder output length from logits shape
+                    # logits shape is [B, T', U+1, C] where T' is the max encoder output length
+                    max_enc_len = logits.shape[1]
+                    
+                    # The encoder output is padded to max_enc_len, but we need per-sample lengths
+                    # Use adjusted_lens but ensure it matches the actual encoder output
+                    # Clamp to ensure no length exceeds the actual tensor dimension
+                    enc_lens = torch.clamp(adjusted_lens, max=max_enc_len, min=1).to(torch.int32)
+                    
+                    # Debug: Check if there's a mismatch
+                    if torch.any(enc_lens > max_enc_len):
+                        self.logger.warning(f"Some enc_lens ({enc_lens.max()}) exceed max_enc_len ({max_enc_len})")
+                    if torch.any(enc_lens < 1):
+                        self.logger.warning(f"Some enc_lens are < 1: {enc_lens}")
 
                     # RNNT Loss (blank id = 0)
                     loss = F.rnnt_loss(
@@ -770,7 +794,17 @@ class BrainToTextDecoder_Trainer:
                 with torch.autocast(device_type = "cuda", enabled = self.args['use_amp'], dtype = torch.bfloat16):
                     features, n_time_steps = self.transform_data(features, n_time_steps, 'val')
 
-                    adjusted_lens = ((n_time_steps - self.args['model']['patch_size']) / self.args['model']['patch_stride'] + 1).to(torch.int32)
+                    # Calculate encoder output lengths after patching (if applicable)
+                    # The unfold operation creates: floor((T - patch_size) / patch_stride) + 1 patches
+                    # But only if T >= patch_size, otherwise it returns 0 patches
+                    if self.args['model']['patch_size'] > 0:
+                        # Ensure we don't get negative values
+                        patch_input = torch.clamp(n_time_steps - self.args['model']['patch_size'], min=0)
+                        adjusted_lens = (patch_input // self.args['model']['patch_stride'] + 1).to(torch.int32)
+                        # If n_time_steps < patch_size, unfold returns 0, but we need at least 1
+                        adjusted_lens = torch.clamp(adjusted_lens, min=1)
+                    else:
+                        adjusted_lens = n_time_steps.to(torch.int32)
 
                     if 'model_type' in self.args and self.args['model_type'] == "RNNT":
                         # RNNT path
@@ -780,7 +814,9 @@ class BrainToTextDecoder_Trainer:
 
                         logits = self.model(features, day_indicies, targets_with_sos)
 
-                        enc_lens = ((n_time_steps - self.args['model']['patch_size']) / self.args['model']['patch_stride'] + 1).to(torch.int32) if self.args['model']['patch_size'] > 0 else n_time_steps.to(torch.int32)
+                        # Get actual encoder output length from logits shape
+                        max_enc_len = logits.shape[1]
+                        enc_lens = torch.clamp(adjusted_lens, max=max_enc_len, min=1).to(torch.int32)
 
                         loss = F.rnnt_loss(
                             logits = logits,

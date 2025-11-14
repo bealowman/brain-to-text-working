@@ -25,6 +25,8 @@ parser.add_argument('--csv_path', type=str, default='../data/t15_copyTaskData_de
                     help='Path to the CSV file with metadata about the dataset (relative to the current working directory).')
 parser.add_argument('--gpu_number', type=int, default=1,
                     help='GPU number to use for RNN model inference. Set to -1 to use CPU.')
+parser.add_argument('--use_diphones', action='store_true', default=False,
+                    help='Use diphones instead of phonemes for evaluation.')
 args = parser.parse_args()
 
 # paths to model and data directories
@@ -40,6 +42,9 @@ b2txt_csv_df = pd.read_csv(args.csv_path)
 
 # load model args
 model_args = OmegaConf.load(os.path.join(model_path, 'checkpoint/args.yaml'))
+
+# Determine if model was trained with diphones
+use_diphones = model_args.get('use_diphones', False)
 
 # set up gpu device
 gpu_number = args.gpu_number
@@ -140,31 +145,65 @@ for session, data in test_data.items():
         pred_seq = [int(p) for p in pred_seq if p != 0]
         # remove consecutive duplicates
         pred_seq = [pred_seq[i] for i in range(len(pred_seq)) if i == 0 or pred_seq[i] != pred_seq[i-1]]
-        # convert to phonemes
-        pred_seq = [LOGIT_TO_PHONEME[p] for p in pred_seq]
-        # add to data
-        data['pred_seq'].append(pred_seq)
-
-        # print out the predicted sequences
+        
+        # Get trial info
         block_num = data['block_num'][trial]
         trial_num = data['trial_num'][trial]
-        true_seq = data['seq_class_ids'][trial][0:data['seq_len'][trial]]
-        true_seq = [LOGIT_TO_PHONEME[p] for p in true_seq]
+        
+        # Store raw indices for edit distance calculation
+        pred_seq_indices = pred_seq.copy()
+        
+        # Convert indices to human-readable strings for storage and printing
+        if use_diphones:
+            pred_seq_display = [LOGIT_TO_DIPHONE[p] for p in pred_seq_indices]
+        else:
+            pred_seq_display = [LOGIT_TO_PHONEME[p] for p in pred_seq_indices]
+        
+        # add to data
+        data['pred_seq'].append(pred_seq_display)
+        
         print(f'Session: {session}, Block: {block_num}, Trial: {trial_num}')
+        
+        # Only compute metrics if ground truth is available (val split)
         if eval_type == 'val':
+            true_seq = data['seq_class_ids'][trial][0:data['seq_len'][trial]]
+            
+            # Convert true sequence indices based on model training
+            if use_diphones:
+                # Convert phoneme indices to diphone indices (same as trainer does)
+                diphone_label = []
+                for i in range(len(true_seq) - 1):
+                    phone_a = true_seq[i]
+                    phone_b = true_seq[i+1]
+                    diphone = (LOGIT_TO_PHONEME[phone_a], LOGIT_TO_PHONEME[phone_b])
+                    diphone_idx = LOGIT_TO_DIPHONE.index(diphone)
+                    diphone_label.append(diphone_idx)
+                true_seq_indices = diphone_label
+            else:
+                true_seq_indices = true_seq
+            
+            # Convert true sequence to human-readable strings
+            if use_diphones:
+                true_seq_display = [LOGIT_TO_DIPHONE[p] for p in true_seq_indices]
+            else:
+                true_seq_display = [LOGIT_TO_PHONEME[p] for p in true_seq_indices]
+            
             sentence_label = data['sentence_label'][trial]
 
             print(f'Sentence label:      {sentence_label}')
-            print(f'True sequence:       {" ".join(true_seq)}')
-            print(f'Word edit distance:  {editdistance.eval(true_seq, pred_seq)}')
-        total_num_phonemes += len(true_seq)
-        aggregate_edit_distance += editdistance.eval(true_seq, pred_seq)
-        print(f'Predicted Sequence:  {" ".join(pred_seq)}')
+            print(f'True sequence:       {" ".join(str(s) for s in true_seq_display)}')
+            print(f'Word edit distance:  {editdistance.eval(true_seq_indices, pred_seq_indices)}')
+            total_num_phonemes += len(true_seq_indices)
+            aggregate_edit_distance += editdistance.eval(true_seq_indices, pred_seq_indices)
+        
+        print(f'Predicted Sequence:  {" ".join(str(s) for s in pred_seq_display)}')
         print()
 
-print(f'Total number of phonemes: {total_num_phonemes}')
+unit_name = 'diphones' if use_diphones else 'phonemes'
+print(f'Total number of {unit_name}: {total_num_phonemes}')
 print(f'Aggregate edit distance: {aggregate_edit_distance}')
-print(f'Aggregate PER: {100 * aggregate_edit_distance / total_num_phonemes:.2f}%')
+if total_num_phonemes > 0:
+    print(f'Aggregate PER: {100 * aggregate_edit_distance / total_num_phonemes:.2f}%')
 
 
 # language model inference via redis

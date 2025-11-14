@@ -14,7 +14,22 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # Make sure CMake knows which Python to target so pybind11 uses the correct suffix (cpython-39, etc.)
-find_package(Python3 COMPONENTS Interpreter Development.Module REQUIRED)
+# If the user passed a custom Python executable, forward it as a proper hint.
+if(DEFINED PYTHON3_EXECUTABLE)
+    set(Python3_EXECUTABLE "${PYTHON3_EXECUTABLE}")
+    # Optionally also set a root dir (two levels up from the exe)
+    get_filename_component(Python3_ROOT_DIR "${Python3_EXECUTABLE}" DIRECTORY)
+    get_filename_component(Python3_ROOT_DIR "${Python3_ROOT_DIR}" DIRECTORY)
+endif()
+
+# Ask CMake for both the interpreter and dev artifacts in ONE call.
+# Use Development for maximum compatibility; it implies Development.Module. :contentReference[oaicite:3]{index=3}
+find_package(Python3 3.9 REQUIRED COMPONENTS Interpreter Development)
+
+message(STATUS "Using Python from: ${Python3_EXECUTABLE}")
+message(STATUS "Python include dirs: ${Python3_INCLUDE_DIRS}")
+message(STATUS "Python libraries: ${Python3_LIBRARIES}")
+
 
 
 add_definitions(-D_GLIBCXX_USE_CXX11_ABI=0)
@@ -85,22 +100,57 @@ set(HIREDIS_LIB hiredis)
 set(TEST_HIREDIS_LIB hiredis)
 add_subdirectory(${CMAKE_SOURCE_DIR}/third_party/redis-plus-plus)
 
-# third_party: libtorch 1.6.0, use FetchContent_Declare to download, and
-# use find_package to find since libtorch is not a standard cmake project
-set(PYTORCH_VERSION "1.13.1")
-if(${CMAKE_SYSTEM_NAME} STREQUAL "Linux")
+# Try to find PyTorch via Python first
+execute_process(
+    COMMAND ${Python3_EXECUTABLE} -c "import torch; import os; print(os.path.dirname(torch.__file__))"
+    OUTPUT_VARIABLE TORCH_PYTHON_PATH
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    RESULT_VARIABLE TORCH_IMPORT_RESULT
+    ERROR_QUIET
+)
+
+# If torch is installed via pip, it won't have CMake config files
+# We need to download libtorch separately or use the system installation
+if(TORCH_IMPORT_RESULT EQUAL 0 AND EXISTS "${TORCH_PYTHON_PATH}")
+    set(TORCH_DIR "${TORCH_PYTHON_PATH}/share/cmake/Torch")
+    if(NOT EXISTS "${TORCH_DIR}/TorchConfig.cmake")
+        # Try parent directory
+        get_filename_component(TORCH_DIR "${TORCH_PYTHON_PATH}/.." ABSOLUTE)
+        set(TORCH_DIR "${TORCH_DIR}/share/cmake/Torch")
+    endif()
+    
+    # If still not found, we need to download libtorch
+    if(NOT EXISTS "${TORCH_DIR}/TorchConfig.cmake")
+        message(STATUS "PyTorch found via Python but no CMake config. Downloading libtorch...")
+        set(PYTORCH_VERSION "1.13.1")
+        set(LIBTORCH_URL "https://download.pytorch.org/libtorch/cpu/libtorch-shared-with-deps-${PYTORCH_VERSION}%2Bcpu.zip")
+        set(URL_HASH "SHA256=d289185802baa1977701b72fc17c8aa6715481703352ce02d6f710cf007dc4f9")
+        
+        FetchContent_Declare(libtorch
+            URL      ${LIBTORCH_URL}
+            URL_HASH ${URL_HASH}
+        )
+        set(gtest_force_shared_crt ON CACHE BOOL "Always use msvcrt.dll" FORCE)
+        FetchContent_MakeAvailable(libtorch)
+        set(TORCH_DIR ${libtorch_SOURCE_DIR})
+    endif()
+else()
+    # Torch not found via Python, download libtorch
+    message(STATUS "PyTorch not found in Python environment. Downloading libtorch...")
+    set(PYTORCH_VERSION "1.13.1")
     set(LIBTORCH_URL "https://download.pytorch.org/libtorch/cpu/libtorch-shared-with-deps-${PYTORCH_VERSION}%2Bcpu.zip")
     set(URL_HASH "SHA256=d289185802baa1977701b72fc17c8aa6715481703352ce02d6f710cf007dc4f9")
-else()
-    message(FATAL_ERROR "Unsupported CMake System Name '${CMAKE_SYSTEM_NAME}' (expected 'Windows', 'Linux' or 'Darwin')")
+    
+    FetchContent_Declare(libtorch
+        URL      ${LIBTORCH_URL}
+        URL_HASH ${URL_HASH}
+    )
+    set(gtest_force_shared_crt ON CACHE BOOL "Always use msvcrt.dll" FORCE)
+    FetchContent_MakeAvailable(libtorch)
+    set(TORCH_DIR ${libtorch_SOURCE_DIR})
 endif()
-FetchContent_Declare(libtorch
-  URL      ${LIBTORCH_URL}
-  URL_HASH ${URL_HASH}
-)
-set(gtest_force_shared_crt ON CACHE BOOL "Always use msvcrt.dll" FORCE)
-FetchContent_MakeAvailable(libtorch)
-find_package(Torch REQUIRED PATHS ${libtorch_SOURCE_DIR} NO_DEFAULT_PATH)
+
+find_package(Torch REQUIRED PATHS ${TORCH_DIR} NO_DEFAULT_PATH)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS} -DC10_USE_GLOG")
 
 # utils
