@@ -11,9 +11,10 @@ import logging
 import sys
 import json
 import pickle
+import wandb
 
 from dataset import BrainToTextDataset, train_test_split_indicies
-from data_augmentations import gauss_smooth, random_mask
+from data_augmentations import gauss_smooth, random_mask, frequency_mask
 
 import torchaudio.functional as F # for edit distance
 from omegaconf import OmegaConf
@@ -56,6 +57,15 @@ class BrainToTextDecoder_Trainer:
         self.val_loader = None 
 
         self.transform_args = self.args['dataset']['data_transforms']
+        self.use_wandb = self.args.get('use_wandb', False)
+        if self.use_wandb:
+            wandb.init(
+                project="b2txt",
+                config=dict(self.args),
+                resume='allow'
+            )
+            wandb.watch(self.model, log='gradients', log_freq=100)
+            self.logger.info("Wandb initialized")
 
         # Create output directory
         if args['mode'] == 'train':
@@ -549,7 +559,10 @@ class BrainToTextDecoder_Trainer:
         train_start_time = time.time()
 
         # train for specified number of batches
+        self.logger.info(f"Training for {self.args['num_training_batches']} batches")
         for i, batch in enumerate(self.train_loader):
+            self.logger.info(f"Training batch {i}")
+            self.logger.info(f"Batches per val step: {self.args['batches_per_val_step']}")
             
             self.model.train()
             self.optimizer.zero_grad()
@@ -571,6 +584,7 @@ class BrainToTextDecoder_Trainer:
 
                 # Apply augmentations to the data
                 features, n_time_steps = self.transform_data(features, n_time_steps, 'train')
+                n_time_steps = torch.clamp(n_time_steps, min=1)
 
                 # Calculate encoder output lengths after patching (if applicable)
                 # The unfold operation creates: floor((T - patch_size) / patch_stride) + 1 patches
@@ -590,11 +604,17 @@ class BrainToTextDecoder_Trainer:
                 if 'model_type' in self.args and self.args['model_type'] == "RNNT":
                     # Build predictor inputs with SOS = blank (0)
                     B = labels.shape[0]
+                    max_target_len_batch = phone_seq_lens.max().item()
+                    labels_truncated = labels[:, :max_target_len_batch] 
                     sos = torch.zeros((B, 1), dtype=torch.long, device=self.device)
-                    targets_with_sos = torch.cat([sos, labels], dim=1)  # [B, U+1]
+                    targets_with_sos = torch.cat([sos, labels_truncated], dim=1)  # [B, U+1]
 
                     # Compute RNNT logits [B, T', U+1, C]
                     logits = self.model(features, day_indicies, targets_with_sos)
+
+                    max_target_len_batch = phone_seq_lens.max().item()
+                    if logits.shape[2] > max_target_len_batch + 1:
+                        logits = logits[:, :, :max_target_len_batch + 1, :]
 
                     # Get actual encoder output length from logits shape
                     # logits shape is [B, T', U+1, C] where T' is the max encoder output length
@@ -612,14 +632,84 @@ class BrainToTextDecoder_Trainer:
                         self.logger.warning(f"Some enc_lens are < 1: {enc_lens}")
 
                     # RNNT Loss (blank id = 0)
-                    loss = F.rnnt_loss(
-                        logits = logits,
-                        targets = labels,
-                        input_lengths = enc_lens,
-                        target_lengths = phone_seq_lens,
-                        blank = 0,
-                        reduction = 'mean'
-                    )
+                    logits_float32 = logits.float()
+                    max_target_len = labels.shape[1]
+                    phone_seq_lens_int32 = torch.clamp(phone_seq_lens.to(torch.int32), min=1, max=max_target_len)
+                    for sample_idx in range(B):
+                        actual_len = phone_seq_lens_int32[sample_idx].item()
+                        # Check if there's non-padding content beyond the claimed length
+                        if actual_len < labels.shape[1]:
+                            # Ensure padding is actually zeros (or blank token)
+                            if not torch.all(labels[sample_idx, actual_len:] == 0):
+                                self.logger.warning(f"Sample {sample_idx}: labels has non-zero content beyond claimed length {actual_len}")
+                    
+                    # Ensure enc_lens doesn't exceed logits encoder dimension
+                    max_enc_len = logits.shape[1]  # T' dimension
+                    enc_lens = torch.clamp(enc_lens, min=1, max=max_enc_len).to(torch.int32)
+                    
+                    # Ensure both are on the same device as logits
+                    enc_lens = enc_lens.to(logits_float32.device)
+                    phone_seq_lens_int32 = phone_seq_lens_int32.to(logits_float32.device)
+                    
+                    # Additional validation: ensure no length exceeds its dimension
+                    # logits shape: [B, T', U+1, C]
+                    # targets (labels) shape: [B, U]
+                    # target_lengths should be <= U (not U+1, because targets don't include SOS)
+                    if torch.any(phone_seq_lens_int32 > max_target_len):
+                        self.logger.warning(f"Clamping phone_seq_lens: some values ({phone_seq_lens_int32.max()}) exceed labels.shape[1] ({max_target_len})")
+                        phone_seq_lens_int32 = torch.clamp(phone_seq_lens_int32, max=max_target_len)
+                    
+                    if torch.any(enc_lens > max_enc_len):
+                        self.logger.warning(f"Clamping enc_lens: some values ({enc_lens.max()}) exceed logits.shape[1] ({max_enc_len})")
+                        enc_lens = torch.clamp(enc_lens, max=max_enc_len)
+
+                    if torch.any(phone_seq_lens_int32 < 1):
+                        self.logger.error(f"Invalid phone_seq_lens: {phone_seq_lens_int32}")
+                        phone_seq_lens_int32 = torch.clamp(phone_seq_lens_int32, min=1)
+                    
+                    if torch.any(enc_lens < 1):
+                        self.logger.error(f"Invalid enc_lens: {enc_lens}")
+                        enc_lens = torch.clamp(enc_lens, min=1)
+                    
+                    # Verify that lengths don't exceed tensor dimensions for each sample
+                    # This is a per-sample check
+                    invalid_enc = enc_lens > max_enc_len
+                    invalid_target = phone_seq_lens_int32 > max_target_len
+                    if torch.any(invalid_enc):
+                        self.logger.error(f"Samples with invalid enc_lens: {torch.where(invalid_enc)[0]}")
+                        self.logger.error(f"Invalid enc_lens values: {enc_lens[invalid_enc]}")
+                        enc_lens = torch.clamp(enc_lens, max=max_enc_len)
+                    if torch.any(invalid_target):
+                        self.logger.error(f"Samples with invalid target_lens: {torch.where(invalid_target)[0]}")
+                        self.logger.error(f"Invalid target_lens values: {phone_seq_lens_int32[invalid_target]}")
+                        phone_seq_lens_int32 = torch.clamp(phone_seq_lens_int32, max=max_target_len)
+                    
+                    # Final validation: ensure all lengths are positive and within bounds
+                    assert torch.all(enc_lens >= 1) and torch.all(enc_lens <= max_enc_len), \
+                        f"enc_lens validation failed: min={enc_lens.min()}, max={enc_lens.max()}, max_enc_len={max_enc_len}"
+                    assert torch.all(phone_seq_lens_int32 >= 1) and torch.all(phone_seq_lens_int32 <= max_target_len), \
+                        f"phone_seq_lens validation failed: min={phone_seq_lens_int32.min()}, max={phone_seq_lens_int32.max()}, max_target_len={max_target_len}"
+                    
+                    labels_truncated_contiguous = labels_truncated.contiguous()
+                    try:
+                        loss = F.rnnt_loss(
+                            logits = logits_float32,
+                            targets = labels_truncated_contiguous,
+                            logit_lengths = enc_lens,
+                            target_lengths = phone_seq_lens_int32,
+                            blank = 0,
+                            reduction = 'mean'
+                        )
+                    except RuntimeError as e:
+                        self.logger.error(f"RNNT loss error: {e}")
+                        self.logger.error(f"logits shape: {logits.shape} (should be [B, T', U+1, C])")
+                        self.logger.error(f"labels shape: {labels.shape} (should be [B, U])")
+                        self.logger.error(f"enc_lens: {enc_lens} (max: {enc_lens.max()}, should be <= {logits.shape[1]})")
+                        self.logger.error(f"phone_seq_lens_int32: {phone_seq_lens_int32} (max: {phone_seq_lens_int32.max()}, should be <= {labels.shape[1]})")
+                        for sample_idx in range(min(5, len(enc_lens))):
+                            self.logger.error(f"Sample {sample_idx}: enc_len={enc_lens[sample_idx]}, target_len={phone_seq_lens_int32[sample_idx]}, "
+                                            f"logits[sample_idx] shape={logits[sample_idx].shape}, labels[sample_idx] shape={labels[sample_idx].shape}")
+                        raise
                 else:
                     logits = self.model(features, day_indicies)
                     # Calculate CTC Loss
@@ -655,14 +745,31 @@ class BrainToTextDecoder_Trainer:
                         f'loss: {(loss.detach().item()):.2f} ' +
                         f'grad norm: {grad_norm:.2f} '
                         f'time: {train_step_duration:.3f}')
+                
+                if self.use_wandb:
+                    wandb.log({
+                        'train/loss': loss.detach().item(),
+                        'train/grad_norm': grad_norm,
+                        'train/step_time': train_step_duration,
+                        'train/lr': self.optimizer.param_groups[0]['lr'],
+                        'train/batch': i,
+                    })
 
             # Incrementally run a test step
+            print(f"DEBUG: Batch {i}, checking validation condition: {i % self.args['batches_per_val_step'] == 0 or i == ((self.args['num_training_batches'] - 1))}")
             if i % self.args['batches_per_val_step'] == 0 or i == ((self.args['num_training_batches'] - 1)):
                 self.logger.info(f"Running test after training batch: {i}")
-                
+                print(f"DEBUG: About to call validation for batch {i}")
                 # Calculate metrics on val data
                 start_time = time.time()
-                val_metrics = self.validation(loader = self.val_loader, return_logits = self.args['save_val_logits'], return_data = self.args['save_val_data'])
+                try:
+                    val_metrics = self.validation(loader = self.val_loader, return_logits = self.args['save_val_logits'], return_data = self.args['save_val_data'])
+                except Exception as e:
+                    self.logger.error(f"Error in validation: {e}")
+                    self.logger.error(f"Skipping validation for batch {i}")
+                    import traceback
+                    self.logger.error(traceback.format_exc())
+                    continue
                 val_step_duration = time.time() - start_time
 
 
@@ -671,12 +778,34 @@ class BrainToTextDecoder_Trainer:
                         f'PER (avg): {val_metrics["avg_PER"]:.4f} ' +
                         f'CTC Loss (avg): {val_metrics["avg_loss"]:.4f} ' +
                         f'time: {val_step_duration:.3f}')
+
+                if self.use_wandb:
+                    log_dict = {
+                        'val/PER': val_metrics['avg_PER'],
+                        'val/loss': val_metrics['avg_loss'],
+                        'val/time': val_step_duration,
+                        'val/batch': i,
+                    }
+
+                    if self.args['log_individual_day_val_PER']:
+                        for day in val_metrics['day_PERs'].keys():
+                            day_per = val_metrics['day_PERs'][day]['total_edit_distance'] / val_metrics['day_PERs'][day]['total_seq_length']
+                            log_dict[f'val/PER_day_{day}'] = day_per
+
+                    wandb.log(log_dict)
+
+                    if new_best:
+                        wandb.log({
+                            'val/best_PER': self.best_val_PER,
+                            'val/best_loss': self.best_val_loss,
+                        }, step=i)
                 
                 if self.args['log_individual_day_val_PER']:
                     for day in val_metrics['day_PERs'].keys():
                         self.logger.info(f"{self.args['dataset']['sessions'][day]} val PER: {val_metrics['day_PERs'][day]['total_edit_distance'] / val_metrics['day_PERs'][day]['total_seq_length']:0.4f}")
 
                 # Save metrics 
+
                 val_PERs.append(val_metrics['avg_PER'])
                 val_losses.append(val_metrics['avg_loss'])
                 val_results.append(val_metrics)
@@ -699,6 +828,13 @@ class BrainToTextDecoder_Trainer:
                     if save_best_checkpoint:
                         self.logger.info(f"Checkpointing model")
                         self.save_model_checkpoint(f'{self.args["checkpoint_dir"]}/best_checkpoint', self.best_val_PER, self.best_val_loss)
+
+                        if self.use_wandb:
+                            wandb.log({
+                                'checkpoint/saved': True,
+                                'checkpoint/best_PER': self.best_val_PER,
+                                'checkpoint/best_loss': self.best_val_loss,
+                            }, step=i)
 
                     # save validation metrics to pickle file
                     if self.args['save_val_metrics']:
@@ -742,6 +878,7 @@ class BrainToTextDecoder_Trainer:
         '''
         Calculate metrics on the validation dataset
         '''
+        self.logger.info("Starting validation")
         self.model.eval()
 
         metrics = {}
@@ -793,6 +930,7 @@ class BrainToTextDecoder_Trainer:
 
                 with torch.autocast(device_type = "cuda", enabled = self.args['use_amp'], dtype = torch.bfloat16):
                     features, n_time_steps = self.transform_data(features, n_time_steps, 'val')
+                    n_time_steps = torch.clamp(n_time_steps, min=1)
 
                     # Calculate encoder output lengths after patching (if applicable)
                     # The unfold operation creates: floor((T - patch_size) / patch_stride) + 1 patches
@@ -809,23 +947,98 @@ class BrainToTextDecoder_Trainer:
                     if 'model_type' in self.args and self.args['model_type'] == "RNNT":
                         # RNNT path
                         B = labels.shape[0]
+                        max_target_len_batch = phone_seq_lens.max().item()
+
+                        labels_truncated = labels[:, :max_target_len_batch]
                         sos = torch.zeros((B, 1), dtype=torch.long, device=self.device)
-                        targets_with_sos = torch.cat([sos, labels], dim=1)
+                        targets_with_sos = torch.cat([sos, labels_truncated], dim=1)
 
                         logits = self.model(features, day_indicies, targets_with_sos)
+
+                        max_target_len_batch = phone_seq_lens.max().item()
+                        if logits.shape[2] > max_target_len_batch + 1:
+                            logits = logits[:, :, :max_target_len_batch + 1, :]
 
                         # Get actual encoder output length from logits shape
                         max_enc_len = logits.shape[1]
                         enc_lens = torch.clamp(adjusted_lens, max=max_enc_len, min=1).to(torch.int32)
+                        logits_float32 = logits.float()
+                        max_target_len = labels.shape[1]
+                        phone_seq_lens_int32 = torch.clamp(phone_seq_lens.to(torch.int32), min=1, max=max_target_len)
+                        for sample_idx in range(B):
+                            actual_len = phone_seq_lens_int32[sample_idx].item()
+                            # Check if there's non-padding content beyond the claimed length
+                            if actual_len < labels.shape[1]:
+                                # Ensure padding is actually zeros (or blank token)
+                                if not torch.all(labels[sample_idx, actual_len:] == 0):
+                                    self.logger.warning(f"Sample {sample_idx}: labels has non-zero content beyond claimed length {actual_len}")
+                        
+                        # Ensure enc_lens doesn't exceed logits encoder dimension
+                        max_enc_len = logits.shape[1]  # T' dimension
+                        enc_lens = torch.clamp(enc_lens, min=1, max=max_enc_len).to(torch.int32)
+                        
+                        # Ensure both are on the same device as logits
+                        enc_lens = enc_lens.to(logits_float32.device)
+                        phone_seq_lens_int32 = phone_seq_lens_int32.to(logits_float32.device)
+                        
+                        # Additional validation: ensure no length exceeds its dimension
+                        # logits shape: [B, T', U+1, C]
+                        # targets (labels) shape: [B, U]
+                        # target_lengths should be <= U (not U+1, because targets don't include SOS)
+                        if torch.any(phone_seq_lens_int32 > max_target_len):
+                            self.logger.warning(f"Clamping phone_seq_lens: some values ({phone_seq_lens_int32.max()}) exceed labels.shape[1] ({max_target_len})")
+                            phone_seq_lens_int32 = torch.clamp(phone_seq_lens_int32, max=max_target_len)
+                        
+                        if torch.any(enc_lens > max_enc_len):
+                            self.logger.warning(f"Clamping enc_lens: some values ({enc_lens.max()}) exceed logits.shape[1] ({max_enc_len})")
+                            enc_lens = torch.clamp(enc_lens, max=max_enc_len)
+                        if torch.any(phone_seq_lens_int32 < 1):
+                            self.logger.error(f"Invalid phone_seq_lens: {phone_seq_lens_int32}")
+                            phone_seq_lens_int32 = torch.clamp(phone_seq_lens_int32, min=1)
+                        
+                        if torch.any(enc_lens < 1):
+                            self.logger.error(f"Invalid enc_lens: {enc_lens}")
+                            enc_lens = torch.clamp(enc_lens, min=1)
+                        
+                        # Verify that lengths don't exceed tensor dimensions for each sample
+                        # This is a per-sample check
+                        invalid_enc = enc_lens > max_enc_len
+                        invalid_target = phone_seq_lens_int32 > max_target_len
+                        if torch.any(invalid_enc):
+                            self.logger.error(f"Samples with invalid enc_lens: {torch.where(invalid_enc)[0]}")
+                            self.logger.error(f"Invalid enc_lens values: {enc_lens[invalid_enc]}")
+                            enc_lens = torch.clamp(enc_lens, max=max_enc_len)
+                        if torch.any(invalid_target):
+                            self.logger.error(f"Samples with invalid target_lens: {torch.where(invalid_target)[0]}")
+                            self.logger.error(f"Invalid target_lens values: {phone_seq_lens_int32[invalid_target]}")
+                            phone_seq_lens_int32 = torch.clamp(phone_seq_lens_int32, max=max_target_len)
+                        
+                        # Final validation: ensure all lengths are positive and within bounds
+                        assert torch.all(enc_lens >= 1) and torch.all(enc_lens <= max_enc_len), \
+                            f"enc_lens validation failed: min={enc_lens.min()}, max={enc_lens.max()}, max_enc_len={max_enc_len}"
+                        assert torch.all(phone_seq_lens_int32 >= 1) and torch.all(phone_seq_lens_int32 <= max_target_len), \
+                            f"phone_seq_lens validation failed: min={phone_seq_lens_int32.min()}, max={phone_seq_lens_int32.max()}, max_target_len={max_target_len}"
 
-                        loss = F.rnnt_loss(
-                            logits = logits,
-                            targets = labels,
-                            input_lengths = enc_lens,
-                            target_lengths = phone_seq_lens,
-                            blank = 0,
-                            reduction = 'mean'
-                        )
+                        labels_truncated_contiguous = labels_truncated.contiguous()
+                        try:
+                            loss = F.rnnt_loss(
+                                logits = logits_float32,
+                                targets = labels_truncated_contiguous,
+                                logit_lengths = enc_lens,
+                                target_lengths = phone_seq_lens_int32,
+                                blank = 0,
+                                reduction = 'mean'
+                            )
+                        except RuntimeError as e:
+                            self.logger.error(f"RNNT loss error: {e}")
+                            self.logger.error(f"logits shape: {logits.shape} (should be [B, T', U+1, C])")
+                            self.logger.error(f"labels shape: {labels.shape} (should be [B, U])")
+                            self.logger.error(f"enc_lens: {enc_lens} (max: {enc_lens.max()}, should be <= {logits.shape[1]})")
+                            self.logger.error(f"phone_seq_lens_int32: {phone_seq_lens_int32} (max: {phone_seq_lens_int32.max()}, should be <= {labels.shape[1]})")
+                            for sample_idx in range(min(5, len(enc_lens))):
+                                self.logger.error(f"Sample {sample_idx}: enc_len={enc_lens[sample_idx]}, target_len={phone_seq_lens_int32[sample_idx]}, "
+                                                f"logits[sample_idx] shape={logits[sample_idx].shape}, labels[sample_idx] shape={labels[sample_idx].shape}")
+                            raise
                     else:
                         logits = self.model(features, day_indicies)
                         loss = self.ctc_loss(
@@ -842,8 +1055,10 @@ class BrainToTextDecoder_Trainer:
                 batch_edit_distance = 0 
                 decoded_seqs = []
                 if 'model_type' in self.args and self.args['model_type'] == "RNNT":
+                    self.logger.info("Starting RNNT greedy decoding")
                     # RNNT greedy decoding per sample
                     preds = self.model.greedy_decode(features, day_indicies, blank_id = 0)
+                    self.logger.info("RNNT greedy decoding completed")
                     for iterIdx in range(len(preds)):
                         decoded_seq = np.array(preds[iterIdx], dtype=np.int64)
                         trueSeq = np.array(
@@ -856,7 +1071,7 @@ class BrainToTextDecoder_Trainer:
                         decoded_seq = torch.argmax(logits[iterIdx, 0 : adjusted_lens[iterIdx], :].clone().detach(),dim=-1)
                         decoded_seq = torch.unique_consecutive(decoded_seq, dim=-1)
                         decoded_seq = decoded_seq.cpu().detach().numpy()
-                        decoded_seq = np.array([i for i in decoded_seq if i != 0])
+                        decoded_seq = np.array([idx for idx in decoded_seq if idx != 0])
                         trueSeq = np.array(
                             labels[iterIdx][0 : phone_seq_lens[iterIdx]].cpu().detach()
                         )
@@ -870,7 +1085,7 @@ class BrainToTextDecoder_Trainer:
 
 
             total_edit_distance += batch_edit_distance
-            total_seq_length += torch.sum(phone_seq_lens)
+            total_seq_length += torch.sum(phone_seq_lens).item()
 
             # Record metrics
             if return_logits: 
@@ -889,10 +1104,26 @@ class BrainToTextDecoder_Trainer:
             metrics['trial_nums'].append(batch['trial_nums'].numpy())
             metrics['day_indicies'].append(batch['day_indicies'].cpu().numpy())
 
-        avg_PER = total_edit_distance / total_seq_length
+        if total_seq_length == 0 or (isinstance(total_seq_length, torch.Tensor) and total_seq_length.item() == 0):
+            self.logger.warning("No validation data processed - all batches may have been skipped")
+            avg_PER = float('inf')
+            avg_loss = float('inf')
+        else:
+            if isinstance(total_seq_length, torch.Tensor):
+                avg_PER = total_edit_distance / total_seq_length.item()
+            else:
+                avg_PER = total_edit_distance / total_seq_length
+            
+            if isinstance(avg_PER, torch.Tensor):
+                avg_PER = avg_PER.item()
+
+            if len(metrics['losses']) > 0:
+                avg_loss = float('inf')
+            else:
+                avg_loss = np.mean(metrics['losses'])
 
         metrics['day_PERs'] = day_per
-        metrics['avg_PER'] = avg_PER.item()
-        metrics['avg_loss'] = np.mean(metrics['losses'])
+        metrics['avg_PER'] = avg_PER
+        metrics['avg_loss'] = avg_loss
 
         return metrics

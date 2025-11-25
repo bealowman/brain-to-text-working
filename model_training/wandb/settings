@@ -1,0 +1,5 @@
+[default]
+entity = nt@b
+project = b2txt
+base_url = https://api.wandb.ai
+

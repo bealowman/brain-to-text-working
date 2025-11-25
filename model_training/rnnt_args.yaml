@@ -50,8 +50,8 @@ weight_decay_day: 0 # weight decay for the day specific input layers
 seed: 10 # random seed for reproducibility
 grad_norm_clip_value: 10 # gradient norm clipping value
 
-batches_per_train_log: 200 # number of batches per training log
-batches_per_val_step: 2000 # number of batches per validation step
+batches_per_train_log: 20 # number of batches per training log
+batches_per_val_step: 100 # number of batches per validation step
 
 batches_per_save: 0 # number of batches per save
 log_individual_day_val_PER: true # whether to log individual day validation performance
@@ -74,7 +74,8 @@ dataset:
       max_mask_width: 0  # maximum width of temporal mask to apply (0 to disable, typical values: 20-40)
 
   neural_dim: 512 # dimensionality of the neural data
-  batch_size: 64 # batch size for training
+  use_wandb: true # whether to use wandb for logging
+  batch_size: 32 # batch size for training
   n_classes: 41 # number of classes (phonemes) in the dataset
   max_seq_elements: 500 # maximum number of sequence elements (phonemes) for any trial
   days_per_batch: 4 # number of randomly-selected days to include in each batch

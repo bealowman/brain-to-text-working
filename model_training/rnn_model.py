@@ -188,6 +188,8 @@ class RNNT(nn.Module):
         # x: [B, T, D]
         day_weights = torch.stack([self.day_weights[i] for i in day_idx], dim=0)
         day_biases = torch.cat([self.day_biases[i] for i in day_idx], dim=0).unsqueeze(1)
+        day_weights = day_weights.to(x.dtype)
+        day_biases = day_biases.to(x.dtype)
         x = torch.einsum("btd,bdk->btk", x, day_weights) + day_biases
         x = self.day_layer_activation(x)
         if self.input_dropout > 0:
@@ -241,6 +243,7 @@ class RNNT(nn.Module):
         Simple RNNT greedy decoding for a single batch (loops over batch elements).
         Returns list of predicted int sequences (without blanks).
         '''
+        x = x.float()
         enc = self.encode(x, day_idx)  # [B, T, E]
         B, T, _ = enc.shape
         results = []

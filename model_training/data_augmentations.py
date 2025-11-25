@@ -24,7 +24,7 @@ def gauss_smooth(inputs, device, smooth_kernel_std=2, smooth_kernel_size=100,  p
     gaussKernel = np.squeeze(gaussKernel / np.sum(gaussKernel))
 
     # Convert to tensor
-    gaussKernel = torch.tensor(gaussKernel, dtype=torch.float32, device=device)
+    gaussKernel = torch.tensor(gaussKernel, dtype=inputs.dtype, device=device)
     gaussKernel = gaussKernel.view(1, 1, -1)  # [1, 1, kernel_size]
 
     # Prepare convolution

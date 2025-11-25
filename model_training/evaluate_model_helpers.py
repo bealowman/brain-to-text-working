@@ -100,21 +100,36 @@ def runSingleDecodingStep(x, input_layer, model, model_args, device):
         )
 
         with torch.no_grad():
-            logits, _ = model(
-                x = x,
-                day_idx = torch.tensor([input_layer], device=device),
-                states = None, # no initial states
-                return_state = True,
-            )
-
-    # convert logits from bfloat16 to float32
-    logits = logits.float().cpu().numpy()
-
-    # # original order is [BLANK, phonemes..., SIL]
-    # # rearrange so the order is [BLANK, SIL, phonemes...]
-    # logits = rearrange_speech_logits_pt(logits)
-
-    return logits
+            if model_args['model_type'] == 'RNNT':
+                # For RNNT, use greedy_decode to get predictions
+                # We'll convert the decoded sequence to logit-like format for compatibility
+                day_idx = torch.tensor([input_layer], device=device)
+                decoded_seqs = model.greedy_decode(x, day_idx, blank_id=0)
+                
+                # Convert decoded sequence to logit format for compatibility with evaluation code
+                # Create a dummy logit array: [T, num_classes] with one-hot at predicted positions
+                # This is a workaround - the evaluation code expects logits
+                max_len = x.shape[1]  # Use input length as max sequence length
+                num_classes = model.num_classes
+                logits = np.zeros((1, max_len, num_classes), dtype=np.float32)
+                
+                # Fill in the decoded sequence
+                if len(decoded_seqs) > 0 and len(decoded_seqs[0]) > 0:
+                    pred_seq = decoded_seqs[0]
+                    for i, token in enumerate(pred_seq[:max_len]):
+                        if token < num_classes:
+                            logits[0, i, token] = 1.0  # One-hot encoding
+                
+                return logits
+            else:
+                logits, _ = model(
+                    x = x,
+                    day_idx = torch.tensor([input_layer], device=device),
+                    states = None, # no initial states
+                    return_state = True,
+                )
+                logits = logits.float().cpu().numpy()
+                return logits
 
 def remove_punctuation(sentence):
     # Remove punctuation

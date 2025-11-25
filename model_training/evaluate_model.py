@@ -9,7 +9,7 @@ from tqdm import tqdm
 import editdistance
 import argparse
 
-from rnn_model import GRUDecoder
+from rnn_model import GRUDecoder, RNNT
 from evaluate_model_helpers import *
 
 # argument parser for command line arguments
@@ -60,18 +60,30 @@ else:
     print('Using CPU for model inference.')
     device = torch.device('cpu')
 
-# define model
-model = GRUDecoder(
-    neural_dim = model_args['model']['n_input_features'],
-    n_units = model_args['model']['n_units'], 
-    n_days = len(model_args['dataset']['sessions']),
-    n_classes = model_args['dataset']['n_classes'],
-    rnn_dropout = model_args['model']['rnn_dropout'],
-    input_dropout = model_args['model']['input_network']['input_layer_dropout'],
-    n_layers = model_args['model']['n_layers'],
-    patch_size = model_args['model']['patch_size'],
-    patch_stride = model_args['model']['patch_stride'],
-)
+if model_args['model_type'] == 'RNNT':
+    model = RNNT(
+        input_dim = model_args['model']['n_input_features'],
+        enc_dim = model_args['model']['n_units'],
+        pred_dim = model_args['model']['n_units'],
+        joint_dim = model_args['model']['n_units'],
+        num_classes = model_args['dataset']['n_classes'],
+        n_days = len(model_args['dataset']['sessions']),
+        input_dropout = model_args['model']['input_network']['input_layer_dropout'],
+        patch_size = model_args['model']['patch_size'],
+        patch_stride = model_args['model']['patch_stride'],
+    )
+else:
+    model = GRUDecoder(
+        neural_dim = model_args['model']['n_input_features'],
+        n_units = model_args['model']['n_units'], 
+        n_days = len(model_args['dataset']['sessions']),
+        n_classes = model_args['dataset']['n_classes'],
+        rnn_dropout = model_args['model']['rnn_dropout'],
+        input_dropout = model_args['model']['input_network']['input_layer_dropout'],
+        n_layers = model_args['model']['n_layers'],
+        patch_size = model_args['model']['patch_size'],
+        patch_stride = model_args['model']['patch_stride'],
+    )
 
 # load model weights
 if torch.device(device).type == 'cuda':
