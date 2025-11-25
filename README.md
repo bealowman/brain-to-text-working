@@ -117,7 +117,7 @@ conda env remove -n b2txt25_lm #if you already had the environment due to broken
 ```
 
 ```bash
-conda create -n b2txt25_lm
+conda create -n b2txt25_lm python=3.9
 ```
 
 ```bash

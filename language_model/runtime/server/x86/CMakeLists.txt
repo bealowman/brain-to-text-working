@@ -61,11 +61,24 @@ FetchContent_Declare(gflags
 FetchContent_MakeAvailable(gflags)
 include_directories(${gflags_BINARY_DIR}/include)
 
+# Force glog to use the FetchContent gflags instead of searching system paths
+# Set these variables before glog's CMake runs its tests
+set(gflags_DIR ${gflags_BINARY_DIR})
+set(gflags_ROOT ${gflags_SOURCE_DIR})
+# CMAKE_REQUIRED_INCLUDES is used by try_compile tests (like DetermineGflagsNamespace)
+set(CMAKE_REQUIRED_INCLUDES ${gflags_BINARY_DIR}/include ${CMAKE_REQUIRED_INCLUDES})
+# Also set include path for general compilation
+set(CMAKE_INCLUDE_PATH ${gflags_BINARY_DIR}/include ${CMAKE_INCLUDE_PATH})
+# Set library path too
+set(CMAKE_LIBRARY_PATH ${gflags_BINARY_DIR} ${CMAKE_LIBRARY_PATH})
+
 # third_party: glog
 FetchContent_Declare(glog
   URL      https://github.com/google/glog/archive/v0.4.0.zip
   URL_HASH SHA256=9e1b54eb2782f53cd8af107ecf08d2ab64b8d0dc2b7f5594472f3bd63ca85cdc
 )
+# Disable gflags in glog - not needed since we use glog through openfst
+set(WITH_GFLAGS OFF CACHE BOOL "Use gflags" FORCE)
 FetchContent_MakeAvailable(glog)
 include_directories(${glog_SOURCE_DIR}/src ${glog_BINARY_DIR})
 
@@ -121,37 +134,118 @@ if(TORCH_IMPORT_RESULT EQUAL 0 AND EXISTS "${TORCH_PYTHON_PATH}")
     
     # If still not found, we need to download libtorch
     if(NOT EXISTS "${TORCH_DIR}/TorchConfig.cmake")
-        message(STATUS "PyTorch found via Python but no CMake config. Downloading libtorch...")
-        set(PYTORCH_VERSION "1.13.1")
-        set(LIBTORCH_URL "https://download.pytorch.org/libtorch/cpu/libtorch-shared-with-deps-${PYTORCH_VERSION}%2Bcpu.zip")
-        set(URL_HASH "SHA256=d289185802baa1977701b72fc17c8aa6715481703352ce02d6f710cf007dc4f9")
+        message(STATUS "PyTorch found via Python but no CMake config. Trying to find libtorch in Python installation...")
         
-        FetchContent_Declare(libtorch
-            URL      ${LIBTORCH_URL}
-            URL_HASH ${URL_HASH}
-        )
-        set(gtest_force_shared_crt ON CACHE BOOL "Always use msvcrt.dll" FORCE)
-        FetchContent_MakeAvailable(libtorch)
-        set(TORCH_DIR ${libtorch_SOURCE_DIR})
+        # For Apple Silicon, try to find libtorch in the Python installation
+        if(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm64")
+            # Try to find libtorch in site-packages
+            execute_process(
+                COMMAND ${Python3_EXECUTABLE} -c "import torch; import os; print(os.path.join(os.path.dirname(torch.__file__), 'lib'))"
+                OUTPUT_VARIABLE TORCH_LIB_DIR
+                OUTPUT_STRIP_TRAILING_WHITESPACE
+                RESULT_VARIABLE TORCH_LIB_RESULT
+            )
+            if(TORCH_LIB_RESULT EQUAL 0 AND EXISTS "${TORCH_LIB_DIR}")
+                message(STATUS "Found PyTorch lib directory: ${TORCH_LIB_DIR}")
+                # For pip-installed PyTorch on Apple Silicon, we need to manually set up paths
+                # The libraries are in torch/lib, but we need to point to a valid TorchConfig location
+                # Since there's no CMake config, we'll need to set up the paths manually later
+                message(WARNING "PyTorch found but no CMake config. Will attempt to use libraries directly.")
+                # Set TORCH_DIR to the lib directory for now
+                set(TORCH_DIR "${TORCH_LIB_DIR}")
+            else()
+                message(FATAL_ERROR "PyTorch found but libtorch not available. For Apple Silicon, please ensure PyTorch is properly installed with: pip install torch")
+            endif()
+        else()
+            # For non-Apple Silicon, download libtorch as before
+            message(STATUS "Downloading libtorch...")
+            set(PYTORCH_VERSION "1.13.1")
+            set(LIBTORCH_URL "https://download.pytorch.org/libtorch/cpu/libtorch-shared-with-deps-${PYTORCH_VERSION}%2Bcpu.zip")
+            set(URL_HASH "SHA256=d289185802baa1977701b72fc17c8aa6715481703352ce02d6f710cf007dc4e9")
+            
+            FetchContent_Declare(libtorch
+                URL      ${LIBTORCH_URL}
+                URL_HASH ${URL_HASH}
+            )
+            set(gtest_force_shared_crt ON CACHE BOOL "Always use msvcrt.dll" FORCE)
+            FetchContent_MakeAvailable(libtorch)
+            set(TORCH_DIR ${libtorch_SOURCE_DIR})
+        endif()
     endif()
-else()
-    # Torch not found via Python, download libtorch
-    message(STATUS "PyTorch not found in Python environment. Downloading libtorch...")
-    set(PYTORCH_VERSION "1.13.1")
-    set(LIBTORCH_URL "https://download.pytorch.org/libtorch/cpu/libtorch-shared-with-deps-${PYTORCH_VERSION}%2Bcpu.zip")
-    set(URL_HASH "SHA256=d289185802baa1977701b72fc17c8aa6715481703352ce02d6f710cf007dc4f9")
-    
-    FetchContent_Declare(libtorch
-        URL      ${LIBTORCH_URL}
-        URL_HASH ${URL_HASH}
-    )
-    set(gtest_force_shared_crt ON CACHE BOOL "Always use msvcrt.dll" FORCE)
-    FetchContent_MakeAvailable(libtorch)
-    set(TORCH_DIR ${libtorch_SOURCE_DIR})
 endif()
 
-find_package(Torch REQUIRED PATHS ${TORCH_DIR} NO_DEFAULT_PATH)
+# Try to find Torch via CMake config
+if(EXISTS "${TORCH_DIR}/TorchConfig.cmake")
+    find_package(Torch REQUIRED PATHS ${TORCH_DIR} NO_DEFAULT_PATH)
+else()
+    # For Apple Silicon with pip-installed PyTorch, manually set up Torch
+    if(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm64")
+        message(STATUS "Torch CMake config not found. Setting up Torch manually for Apple Silicon...")
+        
+        # Get PyTorch installation path
+        execute_process(
+            COMMAND ${Python3_EXECUTABLE} -c "import torch; import os; print(os.path.dirname(torch.__file__))"
+            OUTPUT_VARIABLE TORCH_PYTHON_PATH
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+        )
+        
+        # Set up Torch variables manually
+        set(TORCH_FOUND TRUE)
+        set(TORCH_VERSION "1.13.1")  # Adjust if needed
+        
+        # Include directories
+        set(TORCH_INCLUDE_DIRS 
+            "${TORCH_PYTHON_PATH}/include"
+            "${TORCH_PYTHON_PATH}/include/torch/csrc/api/include"
+        )
+        
+        # Library directory
+        execute_process(
+            COMMAND ${Python3_EXECUTABLE} -c "import torch; import os; print(os.path.join(os.path.dirname(torch.__file__), 'lib'))"
+            OUTPUT_VARIABLE TORCH_LIB_DIR
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+        )
+        
+        # Libraries - find all .so/.dylib files in the lib directory
+        file(GLOB TORCH_LIBS "${TORCH_LIB_DIR}/*.dylib" "${TORCH_LIB_DIR}/*.so")
+        set(TORCH_LIBRARIES ${TORCH_LIBS})
+        
+        # CXX flags
+        set(TORCH_CXX_FLAGS "-D_GLIBCXX_USE_CXX11_ABI=0")
+        
+        message(STATUS "Torch include dirs: ${TORCH_INCLUDE_DIRS}")
+        message(STATUS "Torch lib dir: ${TORCH_LIB_DIR}")
+        message(STATUS "Torch libraries: ${TORCH_LIBRARIES}")
+    else()
+        message(FATAL_ERROR "Could not find Torch CMake config and not on Apple Silicon. Please install libtorch.")
+    endif()
+endif()
+
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS} -DC10_USE_GLOG")
+
+# Filter out Linux-specific linker flags on macOS
+if(APPLE)
+    # Extract only the actual library paths from TORCH_LIBRARIES
+    # PyTorch's CMake adds -Wl,--no-as-needed and -Wl,--as-needed flags
+    # that macOS linker doesn't support
+    set(TORCH_LIBRARIES_FILTERED "")
+    foreach(item ${TORCH_LIBRARIES})
+        # Skip linker flags
+        if(item MATCHES "^-Wl,--(no-)?as-needed")
+            continue()
+        endif()
+        # Extract library path from quoted strings like "-Wl,--no-as-needed,\"/path\""
+        if(item MATCHES "\"([^\"]+)\"")
+            # Extract the quoted path
+            string(REGEX REPLACE ".*\"([^\"]+)\".*" "\\1" lib_path "${item}")
+            list(APPEND TORCH_LIBRARIES_FILTERED "${lib_path}")
+        elseif(item MATCHES "^/.*\\.(so|a)$" OR item MATCHES "^-l")
+            # It's already a clean library path or -l flag
+            list(APPEND TORCH_LIBRARIES_FILTERED "${item}")
+        endif()
+    endforeach()
+    set(TORCH_LIBRARIES ${TORCH_LIBRARIES_FILTERED})
+endif()
 
 # utils
 add_library(utils STATIC
@@ -211,6 +305,8 @@ add_library(decoder STATIC
   decoder/brain_speech_decoder.cc
 )
 target_link_libraries(decoder PUBLIC ${TORCH_LIBRARIES} kaldi-decoder utils kaldi-fstext)
+# Add Torch include directories so decoder can find torch/script.h
+target_include_directories(decoder PUBLIC ${TORCH_INCLUDE_DIRS})
 
 find_package(ZLIB REQUIRED)
 
