@@ -253,13 +253,36 @@ def finalize_remote_lm(
     for entry_id, entry_data in remote_lm_output[0][1]:
         remote_lm_output_final_lastEntrySeen = entry_id
 
-        candidate_sentences = [str(c) for c in entry_data[b'scoring'].decode().split(';')[::5]]
-        candidate_acoustic_scores = [float(c) for c in entry_data[b'scoring'].decode().split(';')[1::5]]
-        candidate_ngram_scores = [float(c) for c in entry_data[b'scoring'].decode().split(';')[2::5]]
-        candidate_llm_scores = [float(c) for c in entry_data[b'scoring'].decode().split(';')[3::5]]
-        candidate_total_scores = [float(c) for c in entry_data[b'scoring'].decode().split(';')[4::5]]
+        scoring_str = entry_data[b'scoring'].decode() if b'scoring' in entry_data else ''
+        
+        # Initialize empty lists
+        candidate_sentences = []
+        candidate_acoustic_scores = []
+        candidate_ngram_scores = []
+        candidate_llm_scores = []
+        candidate_total_scores = []
 
-
+        if scoring_str and scoring_str.strip():
+            try:
+                scoring_parts = scoring_str.split(';')
+                # Each candidate has 5 fields: sentence, acoustic, ngram, llm, total
+                num_candidates = len(scoring_parts) // 5
+                for i in range(num_candidates):
+                    idx = i * 5
+                    if idx + 4 < len(scoring_parts):
+                        candidate_sentences.append(str(scoring_parts[idx]))
+                        candidate_acoustic_scores.append(float(scoring_parts[idx + 1]))
+                        candidate_ngram_scores.append(float(scoring_parts[idx + 2]))
+                        candidate_llm_scores.append(float(scoring_parts[idx + 3]))
+                        candidate_total_scores.append(float(scoring_parts[idx + 4]))
+            except (ValueError, IndexError) as e:
+                print(f'Error parsing scoring field: {e}. Scoring string: {scoring_str[:100]}')
+                candidate_sentences = []
+                candidate_acoustic_scores = []
+                candidate_ngram_scores = []
+                candidate_llm_scores = []
+                candidate_total_scores = []
+    
     # account for a weird edge case where there are no candidate sentences
     if len(candidate_sentences) == 0 or len(candidate_total_scores) == 0:
         print('No candidate sentences were received from the language model.')

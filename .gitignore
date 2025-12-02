@@ -23,3 +23,4 @@ model_training/trained_models/
 checkpoints/
 logs/
 runs/
+language_model/lexicon/

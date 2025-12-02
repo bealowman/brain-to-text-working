@@ -9,9 +9,10 @@ from tqdm import tqdm
 import editdistance
 import argparse
 
-from rnn_model import GRUDecoder
+from rnn_model import GRUDecoder, RNNT
 from evaluate_model_helpers import *
 
+MAX_TRIALS_PER_SESSION = float('inf')
 # argument parser for command line arguments
 parser = argparse.ArgumentParser(description='Evaluate a pretrained RNN model on the copy task dataset.')
 parser.add_argument('--model_path', type=str, default='../data/t15_pretrained_rnn_baseline',
@@ -60,18 +61,30 @@ else:
     print('Using CPU for model inference.')
     device = torch.device('cpu')
 
-# define model
-model = GRUDecoder(
-    neural_dim = model_args['model']['n_input_features'],
-    n_units = model_args['model']['n_units'], 
-    n_days = len(model_args['dataset']['sessions']),
-    n_classes = model_args['dataset']['n_classes'],
-    rnn_dropout = model_args['model']['rnn_dropout'],
-    input_dropout = model_args['model']['input_network']['input_layer_dropout'],
-    n_layers = model_args['model']['n_layers'],
-    patch_size = model_args['model']['patch_size'],
-    patch_stride = model_args['model']['patch_stride'],
-)
+if model_args.get('model_type', 'GRU') == 'RNNT':
+    model = RNNT(
+        input_dim = model_args['model']['n_input_features'],
+        enc_dim = model_args['model']['n_units'],
+        pred_dim = model_args['model']['n_units'],
+        joint_dim = model_args['model']['n_units'],
+        num_classes = model_args['dataset']['n_classes'],
+        n_days = len(model_args['dataset']['sessions']),
+        input_dropout = model_args['model']['input_network']['input_layer_dropout'],
+        patch_size = model_args['model']['patch_size'],
+        patch_stride = model_args['model']['patch_stride'],
+    )
+else:
+    model = GRUDecoder(
+        neural_dim = model_args['model']['n_input_features'],
+        n_units = model_args['model']['n_units'], 
+        n_days = len(model_args['dataset']['sessions']),
+        n_classes = model_args['dataset']['n_classes'],
+        rnn_dropout = model_args['model']['rnn_dropout'],
+        input_dropout = model_args['model']['input_network']['input_layer_dropout'],
+        n_layers = model_args['model']['n_layers'],
+        patch_size = model_args['model']['patch_size'],
+        patch_stride = model_args['model']['patch_stride'],
+    )
 
 # load model weights
 if torch.device(device).type == 'cuda':
@@ -93,7 +106,11 @@ model.eval()
 # load data for each session
 test_data = {}
 total_test_trials = 0
+max_sessions = float('inf')
 for session in model_args['dataset']['sessions']:
+    if max_sessions <= 0:
+        break
+    max_sessions -= 1
     files = [f for f in os.listdir(os.path.join(data_dir, session)) if f.endswith('.hdf5')]
     if f'data_{eval_type}.hdf5' in files:
         eval_file = os.path.join(data_dir, session, f'data_{eval_type}.hdf5')
@@ -115,7 +132,7 @@ with tqdm(total=total_test_trials, desc='Predicting phoneme sequences', unit='tr
         data['pred_seq'] = []
         input_layer = model_args['dataset']['sessions'].index(session)
         
-        for trial in range(len(data['neural_features'])):
+        for trial in range(min(MAX_TRIALS_PER_SESSION, len(data['neural_features']))):
             # get neural input for the trial
             neural_input = data['neural_features'][trial]
 
@@ -123,7 +140,10 @@ with tqdm(total=total_test_trials, desc='Predicting phoneme sequences', unit='tr
             neural_input = np.expand_dims(neural_input, axis=0)
 
             # convert to torch tensor
-            neural_input = torch.tensor(neural_input, device=device, dtype=torch.bfloat16)
+            if torch.cuda.is_available() and model_args.get('use_amp', False):
+                neural_input = torch.tensor(neural_input, device=device, dtype=torch.bfloat16)
+            else:
+                neural_input = torch.tensor(neural_input, device=device, dtype=torch.float32)
 
             # run decoding step
             logits = runSingleDecodingStep(neural_input, input_layer, model, model_args, device)
@@ -140,6 +160,7 @@ for session, data in test_data.items():
     data['pred_seq'] = []
     for trial in range(len(data['logits'])):
         logits = data['logits'][trial][0]
+        print(f"len logits: {len(logits)}")
         pred_seq = np.argmax(logits, axis=-1)
         # remove blanks (0)
         pred_seq = [int(p) for p in pred_seq if p != 0]
@@ -234,9 +255,15 @@ lm_results = {
 
 # loop through all trials and put logits into the remote language model to get text predictions
 # note: this takes ~15-20 minutes to run on the entire test split with the 5-gram LM + OPT rescoring (RTX 4090)
+SKIP_TRIALS = {326, 386, 541, 542, 1363}
 with tqdm(total=total_test_trials, desc='Running remote language model', unit='trial') as pbar:
+    trial_count = 0
     for session in test_data.keys():
-        for trial in range(len(test_data[session]['logits'])):
+        for trial in range(min(MAX_TRIALS_PER_SESSION, len(test_data[session]['logits']))):
+            if trial_count in SKIP_TRIALS:
+                pbar.update(1)
+                trial_count += 1
+                continue
             # get trial logits and rearrange them for the LM
             logits = rearrange_speech_logits_pt(test_data[session]['logits'][trial])[0]
 
@@ -285,6 +312,7 @@ with tqdm(total=total_test_trials, desc='Running remote language model', unit='t
 
             # update progress bar
             pbar.update(1)
+            trial_count += 1
 pbar.close()
 
 
